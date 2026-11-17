@@ -404,7 +404,11 @@ const RESPONSES_MODELS = new Set(
   .filter(Boolean),
 );
 const FRESH_IP_MODEL = process.env.FRESH_IP_MODEL ?? PROBE_MODELS[0];
-const MAX_RESET_ATTEMPTS = envInt("MAX_RESET_ATTEMPTS", 10, { min: 1, max: 50 });
+const MAX_RESET_ATTEMPTS = envInt("MAX_RESET_ATTEMPTS", 3, { min: 1, max: 50 });
+// A 429 whose retry-after outlasts any useful rotation window (observed ~85000s
+// = upstream quota until 00:00 UTC) will 429 again on the next fresh egress:
+// rotating further only churns the container. Give up until the next sweep.
+const RETRY_AFTER_GIVE_UP_S = envInt("RETRY_AFTER_GIVE_UP_S", 900, { min: 0 });
 const SOFT_ROTATIONS_BEFORE_TIER2 = envInt("SOFT_ROTATIONS_BEFORE_TIER2", 1, { min: 1, max: 50 });
 const GLOBAL_QUOTA_GUARD = Math.min(envInt("GLOBAL_QUOTA_GUARD", Math.max(8, COUNT - 1), { min: 1 }), COUNT);
 const MAX_POOL_REGISTRATIONS_PER_HOUR = envInt("MAX_POOL_REGISTRATIONS_PER_HOUR", 60, { min: 1, max: 200 });
@@ -966,7 +970,9 @@ async function probeFingerprintMatrix() {
 /** Query a container's current egress IPv6 via Cloudflare trace. */
 async function getEgressIp(index) {
  try {
-  const out = await docker(["exec", containerName(index), "curl", "-s", "-m", "8", "https://cloudflare.com/cdn-cgi/trace"], 25_000);
+  // MicroWARP/MASQUE: plain curl exits the container WITHOUT the tunnel
+  // (warp=off, host IP); the trace must go through usque's local socks port.
+  const out = await docker(["exec", containerName(index), "curl", "-s", "-m", "8", "-x", "socks5h://127.0.0.1:1080", "https://cloudflare.com/cdn-cgi/trace"], 25_000);
   const ipMatch = out.match(/^ip=(.+)$/m);
   const warpMatch = out.match(/^warp=(.+)$/m);
   if (ipMatch && warpMatch && warpMatch[1].trim() === "on") {
@@ -1167,10 +1173,26 @@ async function rotateContainer(index, tier, attempt) {
  return enqueueRestart(async () => {
   const started = now();
   if (tier === 2) {
-   log(`#${index} [attempt ${attempt}] full reset (t2) — deleting wg0.conf and restarting ${container}`);
-   await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
-   await docker(["restart", container], 60_000);
-   saveTier2State(index, started);
+   let hasWg0 = false;
+   try {
+    await docker(["exec", container, "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+    hasWg0 = true;
+   } catch {
+    hasWg0 = false;
+   }
+   if (!hasWg0) {
+    // MicroWARP/MASQUE node: no wg0.conf, and there is no re-key — deleting
+    // masque-config.json would break the device registration. A plain restart
+    // is the only MASQUE rotation: usque picks up a new /64 after a cold
+    // start (verified 2026-11-17 on warp-2).
+    log(`#${index} [attempt ${attempt}] full reset requested but ${container} has no wg0.conf (MASQUE) — plain restart instead`);
+    await docker(["restart", container], 60_000);
+   } else {
+    log(`#${index} [attempt ${attempt}] full reset (t2) — deleting wg0.conf and restarting ${container}`);
+    await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+    await docker(["restart", container], 60_000);
+    saveTier2State(index, started);
+   }
   } else {
    log(`#${index} [attempt ${attempt}] soft restart (t1) — restarting ${container} (wg0.conf kept)`);
    await docker(["restart", container], 60_000);
@@ -1268,6 +1290,11 @@ async function resetRelayUntilClean(index, models, state) {
   }
   if (failing.every((r) => r.status === 429)) {
    rememberThrottledPrefix(pfx, failing[0].retryAfter || 3600);
+   if (failing[0].retryAfter && failing[0].retryAfter >= RETRY_AFTER_GIVE_UP_S) {
+    patchRelay(state, index, { dirty: true, lastProbe: now(), probeAfter: now() + failing[0].retryAfter * 1000, last429: { model: failing[0].model, ts: now() } });
+    log(`#${index} [attempt ${attempt}] retry-after ${failing[0].retryAfter}s exceeds rotation horizon — giving up until next sweep`);
+    return false;
+   }
    log(
     `#${index} [attempt ${attempt}] still 429 on the new egress` +
      (failing[0].retryAfter ? ` (retry-after: ${failing[0].retryAfter}s)` : "") +
@@ -1287,7 +1314,7 @@ async function resetRelayUntilClean(index, models, state) {
   return false;
  }
  patchRelay(state, index, { dirty: true, lastProbe: now(), probeAfter: now() + RELAY_COOLDOWN_S * 1000 });
- log(`#${index} still rate-limited after ${MAX_RESET_ATTEMPTS} rotation attempt(s)`);
+ log(`#${index} rotation failed, giving up until next sweep (${MAX_RESET_ATTEMPTS} attempt(s) spent)`);
  return false;
 }
 
@@ -1353,6 +1380,15 @@ async function sweep() {
    continue;
   }
   log(`#${index} rate limited on ${rotatable.map((r) => r.model).join(", ")} — queued for reset`);
+  // Known-hopeless quota window (retry-after longer than any rotation can
+  // outlive): restarting the node cannot clear it — skip before touching it.
+  const horizon = rotatable.find((r) => Number.isFinite(r.retryAfter) && r.retryAfter >= RETRY_AFTER_GIVE_UP_S);
+  if (horizon) {
+   patchRelay(state, index, { dirty: true, lastProbe: now(), probeAfter: now() + horizon.retryAfter * 1000, last429: { model: horizon.model, ts: now() } });
+   leftAlone.push(index);
+   log(`#${index} 429 retry-after ${horizon.retryAfter}s exceeds rotation horizon — left alone until next sweep`);
+   continue;
+  }
   toReset.push(index);
  }
 
